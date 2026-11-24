@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""ru-text — команды для правил написания русских текстов.
+
+  ru-text add "было" "стало" ["пояснение"]
+      Записать поправку от пользователя в inbox.md.
+
+  ru-text changed
+      Вызывается хуком UserPromptSubmit. Если rules.md изменился после того,
+      как сессия прочитала его, велит модели перечитать файл.
+
+  ru-text stats [--since ДАТА] [--until ДАТА] [--examples N]
+      Посчитать по протоколам сессий, что и как часто пишут модели.
+      Список счётчиков — в patterns.py рядом с этим файлом.
+
+Пути можно переопределить переменными окружения RU_TEXT_RULES, RU_TEXT_INBOX,
+RU_TEXT_STATE и RU_TEXT_TRANSCRIPTS — это нужно для проверок.
+"""
+
+import collections
+import datetime
+import glob
+import hashlib
+import json
+import os
+import re
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RULES = os.environ.get("RU_TEXT_RULES", os.path.join(ROOT, "rules.md"))
+INBOX = os.environ.get("RU_TEXT_INBOX", os.path.join(ROOT, "inbox.md"))
+STATE = os.environ.get("RU_TEXT_STATE", os.path.join(ROOT, ".state"))
+TRANSCRIPTS = os.environ.get(
+    "RU_TEXT_TRANSCRIPTS", os.path.join(os.path.expanduser("~"), ".claude", "projects")
+)
+CYR = re.compile(r"[А-Яа-яЁё]")
+
+INBOX_HEADER = (
+    "# Поправки: было → стало\n\n"
+    "Сюда команда `ru-text add` записывает пары из всех сессий, когда пользователь "
+    "поправляет русскую фразу. Накопившееся разбирают: повторы убирают, общее "
+    "превращают в правило и переносят в `rules.md`.\n\n"
+    "| Дата | Проект | Написала модель | Как надо | Пояснение |\n"
+    "|---|---|---|---|---|\n"
+)
+
+NOTICE = (
+    "Правила русских текстов изменились с того момента, как ты их читал. "
+    "Прочитай файл {rules} целиком и дальше пиши по-русски по нему, "
+    "начиная с ответа на это сообщение."
+)
+
+STATS_USAGE = """нужно: ru-text stats [--since ДАТА] [--until ДАТА] [--examples N]
+    ДАТА — день (2026-11-25) или момент (2026-11-25T00:11) в местном времени.
+    Точка «до» появления правил: --until 2026-11-24. «После»: --since 2026-11-25.
+    --examples N — показать до N примеров на каждый счётчик.
+"""
+
+
+def cell(text, limit=400):
+    """Привести текст к виду, безопасному для ячейки таблицы."""
+    text = " ".join(text.split()).replace("|", "\\|")
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "…"
+    return text
+
+
+def iso_to_epoch(stamp):
+    """Метка времени протокола в секундах; при чём угодно непонятном — None."""
+    try:
+        return datetime.datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def cmd_add(args):
+    if len(args) < 2:
+        sys.stderr.write('нужно: ru-text add "было" "стало" ["пояснение"]\n')
+        return 1
+    home = os.path.expanduser("~")
+    project = os.path.basename(os.getcwd()) if os.getcwd() != home else "—"
+    row = "| {} | {} | {} | {} | {} |\n".format(
+        datetime.date.today().isoformat(),
+        cell(project),
+        cell(args[0]),
+        cell(args[1]),
+        cell(args[2]) if len(args) > 2 else "",
+    )
+    if not os.path.exists(INBOX):
+        with open(INBOX, "w", encoding="utf-8") as f:
+            f.write(INBOX_HEADER)
+    with open(INBOX, "a", encoding="utf-8") as f:
+        f.write(row)
+    sys.stdout.write(
+        "Записал в inbox.md: «{}» → «{}»\n".format(cell(args[0], 80), cell(args[1], 80))
+    )
+    return 0
+
+
+def session_start(transcript):
+    """Время начала сессии в секундах — по первой записи протокола с меткой времени."""
+    try:
+        with open(transcript, encoding="utf-8") as f:
+            for _, line in zip(range(50), f):
+                try:
+                    stamp = iso_to_epoch(json.loads(line).get("timestamp"))
+                except ValueError:
+                    continue
+                if stamp is not None:
+                    return stamp
+    except OSError:
+        pass
+    return None
+
+
+def cmd_changed():
+    try:
+        data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace"))
+    except ValueError:
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    session = data.get("session_id")
+    if not session or not os.path.exists(RULES):
+        return 0
+    with open(RULES, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+
+    # Дальше любая ошибка — не повод мешать сессии: хук молчит.
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        path = os.path.join(STATE, re.sub(r"[^A-Za-z0-9_-]", "_", session))
+        try:
+            with open(path, encoding="ascii") as f:
+                seen = f.read().strip()
+        except OSError:
+            seen = None
+        if seen == digest:
+            return 0
+
+        start = session_start(data.get("transcript_path") or "")
+        stale = start is not None and os.path.getmtime(RULES) > start
+        with open(path, "w", encoding="ascii") as f:
+            f.write(digest)
+        # О первой сессии без записи: правила успели загрузиться при старте — молчим.
+        if seen is None and not stale:
+            return 0
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "suppressOutput": True,
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": NOTICE.format(rules=RULES),
+                    },
+                }
+            )
+            + "\n"
+        )
+    except OSError:
+        pass
+    return 0
+
+
+def parse_bound(text, start):
+    """Граница периода в местном времени: день («2026-11-25») или момент («2026-11-25T00:11»)."""
+    text = text.strip()
+    if len(text) == 10:
+        day = datetime.date.fromisoformat(text)
+        moment = datetime.datetime(day.year, day.month, day.day)
+        if not start:
+            moment += datetime.timedelta(days=1)
+        return moment.timestamp()
+    body = text.rstrip("Zz")
+    moment = datetime.datetime.fromisoformat(body[:19])
+    if not start and len(body) <= 16:
+        moment += datetime.timedelta(seconds=59)  # до конца указанной минуты
+    return moment.timestamp()
+
+
+def load_patterns():
+    """Счётчики из patterns.py; испорченное регулярное выражение пропускается с сообщением."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        import patterns
+    except ImportError as e:
+        sys.stderr.write("не читается patterns.py: {}\n".format(e))
+        return []
+    compiled = []
+    only = {}  # имя счётчика → источники, в которых его считать; иначе — во всех
+    for group, items in patterns.PATTERNS:
+        for item in items:
+            name, regex = item[0], item[1]
+            try:
+                compiled.append((group, name, re.compile(regex, re.S)))
+            except re.error as e:
+                sys.stderr.write("пропущен счётчик «{}»: {}\n".format(name, e))
+                continue
+            if len(item) > 2:
+                only[name] = tuple(item[2])
+    return compiled, only
+
+
+def texts_of(rec):
+    """Тексты, которые написала модель в одной записи протокола: (источник, текст)."""
+    out = []
+    msg = rec.get("message")
+    if rec.get("type") != "assistant" or not isinstance(msg, dict):
+        return out
+    content = msg.get("content")
+    if isinstance(content, str):
+        return [("reply", content)]
+    if not isinstance(content, list):
+        return out
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if kind == "text":
+            out.append(("reply", item.get("text") or ""))
+        elif kind == "tool_use":
+            inp = item.get("input") or {}
+            name = item.get("name")
+            if name == "Write":
+                out.append(("file", str(inp.get("content") or "")))
+            elif name == "Edit":
+                out.append(("file", str(inp.get("new_string") or "")))
+            elif name == "Bash":
+                out.append(("desc", str(inp.get("description") or "")))
+            elif name == "AskUserQuestion":
+                out.append(("other", json.dumps(inp.get("questions"), ensure_ascii=False)))
+            elif name in ("Agent", "SendMessage"):
+                out.append(("other", str(inp.get("prompt") or inp.get("message") or "")))
+    return out
+
+
+LABELS = (("reply", "ответы"), ("file", "файлы"), ("desc", "описания"), ("other", "прочее"))
+
+
+def cmd_stats(args):
+    bounds = {}
+    shown = {}
+    examples = 0
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        try:
+            if arg in ("--since", "--until") and i + 1 < len(args):
+                bounds[arg] = parse_bound(args[i + 1], start=arg == "--since")
+                shown[arg] = args[i + 1]
+                i += 2
+            elif arg == "--examples" and i + 1 < len(args):
+                examples = max(0, int(args[i + 1]))
+                i += 2
+            else:
+                raise ValueError(arg)
+        except ValueError:
+            sys.stderr.write("не понял аргумент: " + arg + "\n" + STATS_USAGE)
+            return 1
+
+    compiled, only = load_patterns()
+    if not compiled:
+        return 1
+    skip_dir = "-" + ROOT.lstrip("/").replace("/", "-")
+
+    # Строки из наших же правил не считаются: сессии цитируют таблицы и копируют их в файлы.
+    own_lines = set()
+    for path in (RULES, os.path.join(ROOT, "glossary.md")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                own_lines.update(line.strip() for line in f if len(line.strip()) >= 25)
+        except OSError:
+            pass
+    hits = {name: collections.Counter() for _, name, _ in compiled}
+    snips = {name: [] for _, name, _ in compiled}
+    base = collections.Counter()
+    first_words = collections.Counter()
+    sessions = set()
+    stamps = []
+    seen = set()
+    files = 0
+
+    for path in glob.glob(TRANSCRIPTS + "/**/*.jsonl", recursive=True):
+        if skip_dir in path:
+            continue
+        try:
+            fh = open(path, encoding="utf-8")
+        except OSError:
+            continue
+        counted = False
+        with fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                stamp = iso_to_epoch(rec.get("timestamp"))
+                if stamp is None:
+                    continue
+                if ("--since" in bounds and stamp < bounds["--since"]) or (
+                    "--until" in bounds and stamp > bounds["--until"]
+                ):
+                    continue
+                stamps.append(stamp)
+                if not counted:  # файл считается, только если в нём есть записи за период
+                    counted = True
+                    files += 1
+                if rec.get("sessionId"):
+                    sessions.add(rec["sessionId"])
+                for source, text in texts_of(rec):
+                    if not text or not CYR.search(text):
+                        continue
+                    key = (source, text[:400])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    base["блоки:" + source] += 1
+                    if source == "reply" and len(CYR.findall(text)) >= 100:
+                        base["полноценные"] += 1
+                        word = re.match(r"\s*([А-Яа-яЁёA-Za-z-]+)", text)
+                        if word:
+                            first_words[word.group(1).lower()] += 1
+                    if own_lines:
+                        text = "\n".join(
+                            "" if line.strip() in own_lines else line for line in text.split("\n")
+                        )
+                        if not CYR.search(text):
+                            continue
+                    for _, name, regex in compiled:
+                        if source not in only.get(name, (source,)):
+                            continue
+                        found = list(regex.finditer(text))
+                        if not found:
+                            continue
+                        hits[name][source] += len(found)
+                        for match in found[: max(0, examples - len(snips[name]))]:
+                            a = max(0, match.start() - 45)
+                            b = min(len(text), match.end() + 45)
+                            snips[name].append(re.sub(r"\s+", " ", text[a:b]).strip())
+
+    def moment(ts):
+        return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+    period = ", ".join(("после " if key == "--since" else "до ") + text for key, text in shown.items())
+    if stamps:
+        print(
+            "Протоколы: файлов {}, сессий {}, записи с {} по {} (местное время{}); папка {} исключена".format(
+                files,
+                len(sessions),
+                moment(min(stamps)),
+                moment(max(stamps)),
+                "; запрошено: " + period if period else "",
+                os.path.basename(ROOT),
+            )
+        )
+    else:
+        print("Протоколы: в этом периоде записей нет")
+    print(
+        "Текстов: ответов {} (полноценных, от 100 русских букв, — {}), записей в файлы {}, "
+        "описаний команд {}, прочего {}".format(
+            base["блоки:reply"], base["полноценные"], base["блоки:file"], base["блоки:desc"], base["блоки:other"]
+        )
+    )
+    if first_words:
+        print(
+            "С чего начинается ответ: "
+            + ", ".join("{} {}".format(word, count) for word, count in first_words.most_common(15))
+        )
+
+    groups = list(collections.OrderedDict((group, None) for group, _, _ in compiled))
+    for group in groups:
+        rows = [(name, sum(hits[name].values())) for g, name, _ in compiled if g == group]
+        rows = sorted((row for row in rows if row[1]), key=lambda row: -row[1])
+        print("\n== " + group + " ==")
+        if not rows:
+            print("   ничего")
+        for name, total in rows:
+            parts = ", ".join("{} {}".format(label, hits[name][source]) for source, label in LABELS if hits[name][source])
+            print("   {} — {} ({})".format(name, total, parts))
+            for snip in snips[name]:
+                print("        …" + snip[:120] + "…")
+    return 0
+
+
+def main():
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+    command = sys.argv[1] if len(sys.argv) > 1 else ""
+    if command == "add":
+        return cmd_add(sys.argv[2:])
+    if command == "changed":
+        try:
+            return cmd_changed()
+        except Exception:
+            return 0
+    if command == "stats":
+        return cmd_stats(sys.argv[2:])
+    sys.stderr.write("команды: add, changed, stats\n" + STATS_USAGE)
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        # Вывод оборван, например, командой head: тихо завершаемся.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
