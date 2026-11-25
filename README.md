@@ -29,7 +29,7 @@
 
 1. Склонировать репозиторий куда удобно:
 
-       git clone <адрес-репозитория> <папка>
+       git clone git@github.com:code-skald/ru-text.git <папка>
 
 2. Подключить правила: дописать в `~/.claude/CLAUDE.md` строку
 
